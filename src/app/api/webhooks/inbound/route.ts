@@ -200,6 +200,8 @@ export async function POST(req: NextRequest) {
         const protocol = req.nextUrl.protocol || 'http:';
         const magicLinkUrl = `${protocol}//${host}/alerts/${insertedReview.id}?token=${token}`;
 
+        let emailQueued = false;
+
         if (matchedBusiness?.ownerEmail) {
           const emailParams = {
             reviewEventId: insertedReview.id,
@@ -212,11 +214,17 @@ export async function POST(req: NextRequest) {
             businessName: matchedBusiness.name,
             ownerName: matchedBusiness.ownerName,
           };
-          const delivery = await createPendingAlertDelivery(emailParams);
 
-          after(async () => {
-            await sendPendingReviewAlertEmail(delivery.id, emailParams);
-          });
+          try {
+            const delivery = await createPendingAlertDelivery(emailParams);
+            emailQueued = true;
+
+            after(async () => {
+              await sendPendingReviewAlertEmail(delivery.id, emailParams);
+            });
+          } catch (alertError) {
+            console.error('Failed to queue review alert email, continuing webhook response:', alertError);
+          }
         }
 
         return NextResponse.json({
@@ -224,7 +232,7 @@ export async function POST(req: NextRequest) {
           reviewId: insertedReview.id,
           confidence: parseResult.confidence_score,
           magicLink: magicLinkUrl,
-          emailQueued: Boolean(matchedBusiness?.ownerEmail),
+          emailQueued,
         });
       }
 
