@@ -1,0 +1,168 @@
+# 实施计划 - ReviewGuard V1 (Demo / Concierge-ready MVP 终极版)
+
+这份计划对 ReviewGuard V1 的定位进行了极其精准的重构：**它是一个“V1 Demo / Concierge-ready MVP”**。
+
+它的核心使命是：**能接真实邮件、能发真实告警、能展示高防翻车草稿、能用来向美国 HVAC/水管工做冷启动拓客 (Cold Outreach) 并验证付费意愿。**
+
+---
+
+## 终极工程与产品修正
+
+> [!IMPORTANT]
+> **开工前的最后补坑与工程细节对齐：**
+>
+> 1. **Webhook 安全升级 (No Query Params)：**
+>    - Webhook Secret 从 URL 查询参数中移除，统一通过请求头 **`X-ReviewGuard-Webhook-Secret`** 进行传输，彻底避免在 Nginx/Vercel 等访问日志或链路跟踪中泄露密钥。
+>
+> 2. **更严密的 `alert_deliveries` 状态机：**
+>    - 在调用 Resend/Postmark API 发信前，数据库立即创建一条状态为 **`pending`** 的发信记录。
+>    - 发信成功更新为 **`sent`**，失败则更新为 **`failed`** 并记录错误日志。这从物理上杜绝了发信中途崩溃后，系统无法审计“到底有没有尝试过发信”的盲区。
+>
+> 3. **Magic Link 极致安全防护：**
+>    - **Token 生成**：采用 128-bit 密码学安全的随机 String (如 UUIDv4)。
+>    - **过期防线**：固定 **72 小时**有效期，过期阻断。
+>    - **语义清晰化**：在 V1 中不强求 single-use（避免老板因刷新页面导致链接失效），但增加记录 `viewed_at`（首次打开时间）与 `copied_at`（点击 Copy 复制草稿时间）。
+>    - **隐私最小化**：Magic Page 仅展示当前评价与对应草稿，绝不显示商家后台设置等任何敏感配置，页面底部常驻显著提示：`"⚠️ This temporary link will expire in 72 hours."`
+>
+> 4. **低置信度告警全通达 (Low-Confidence Alerting)：**
+>    - 即使邮件解析置信度低于 0.85，系统也**必须**生成并投递警报邮件！
+>    - **文案脱敏**：告警邮件主题与正文自动转换为：“我们检测到了可能的 Google 评价通知，但无法完全自动提取原文。请直接点击下方链接，粘贴评价原文以瞬间生成 AI 专业回复。” 确保商家绝对不漏掉任何潜在差评。
+>
+> 5. **Gmail 验证码提取（Onboarding 杀手级体验）：**
+>    - 彻底理清 Gmail 验证逻辑：当商家在 Gmail 设置转发到 ReviewGuard 生成的专属邮箱时，Google 会发送一封主题包含 `Gmail Forwarding Confirmation` 的验证邮件。
+>    - **我们的 Parser 专门拦截此类邮件**，提取其中的 `Confirmation Code`（验证码）和 `Confirmation URL`，并将其展现在商家的 Onboarding 步骤页面上。
+>    - **商家直接在我们的系统里复制验证码**，填回 Gmail 即可完成验证。这种智能提取把 Gmail 的手动配置摩擦力降到了最低！
+>
+> 6. **定制 Snapshot 拓客报告页 (Cold Reachout Section)：**
+>    - **新增独立公开路由 `/snapshot/[business_slug]`**。该页面完全独立于 Dashboard，专门用于冷开。
+>    - 我们可以手动在后台录入某个目标商家的真实低星未回复评价，生成这个专属的 Snapshot 报告页。
+>    - **页面内容**：展示商家的真实差评 + 我们为其量身定制的 AI 专业回复草稿 + 超大的 `"Want ReviewGuard to monitor these and send you drafts in 2 minutes? Try it free"` 呼吁行动 (CTA) 按钮。
+>    - **用途**：冷开发送定制 snapshot 链接给老板，证明痛点与产品价值，跑通 V0-V1 商业闭环。
+
+---
+
+## 完善的 Postgres 数据库表结构 (Drizzle Schema)
+
+```mermaid
+classDiagram
+    businesses --> inbound_emails : 1对多 (转发关联)
+    inbound_emails --> review_events : 1对多 (解析关联)
+    review_events --> response_drafts : 1对1 (草稿关联)
+    review_events --> magic_links : 1对多 (安全访问)
+    review_events --> alert_deliveries : 1对多 (发信审计)
+
+    class businesses {
+        +uuid id
+        +string name
+        +string inbound_prefix
+        +string gbp_review_url
+        +string owner_email
+        +string owner_phone
+        +string owner_name
+        +datetime created_at
+    }
+    class inbound_emails {
+        +uuid id
+        +string message_id (唯一索引)
+        +uuid business_id (外键)
+        +string subject
+        +string raw_html
+        +float confidence_score
+        +string status ("parsed" | "failed" | "gmail_verification")
+        +string error_message
+        +datetime created_at
+    }
+    class review_events {
+        +uuid id
+        +uuid inbound_email_id (外键)
+        +string reviewer
+        +integer rating (1-5)
+        +string content
+        +string status ("drafted" | "needs_text")
+        +datetime created_at
+    }
+    class response_drafts {
+        +uuid id
+        +uuid review_event_id (外键, 唯一)
+        +string professional_draft
+        +string warm_draft
+        +string short_draft
+        +datetime created_at
+    }
+    class magic_links {
+        +uuid id
+        +string token (唯一索引)
+        +uuid review_event_id (外键)
+        +datetime expires_at
+        +datetime viewed_at
+        +datetime copied_at
+        +datetime created_at
+    }
+    class alert_deliveries {
+        +uuid id
+        +uuid review_event_id (外键)
+        +string recipient_email
+        +string status ("pending" | "sent" | "failed")
+        +string provider_message_id
+        +string error_message
+        +datetime created_at
+    }
+```
+
+---
+
+## 拟新建与修改的文件
+
+### 1. 数据库与基础设施层
+* #### [NEW] [drizzle.config.ts](file:///c:/Users/Administrator/Desktop/Review_Guard/drizzle.config.ts)
+  - Drizzle Postgres 配置文件。
+* #### [NEW] [src/lib/db.ts](file:///c:/Users/Administrator/Desktop/Review_Guard/src/lib/db.ts) 与 [src/db/schema.ts](file:///c:/Users/Administrator/Desktop/Review_Guard/src/db/schema.ts)
+  - 定义六大核心 Postgres 数据表及它们的多对一、一对一外键级联与唯一索引。
+
+### 2. 核心服务与 API Webhook
+* #### [NEW] [src/lib/parser.ts](file:///c:/Users/Administrator/Desktop/Review_Guard/src/lib/parser.ts)
+  - 解析英文 Google Review 通知邮件（置信度算法）及 **Gmail Verification 验证邮件**。
+* #### [NEW] [src/lib/ai.ts](file:///c:/Users/Administrator/Desktop/Review_Guard/src/lib/ai.ts)
+  - 严格合规提示词：为三种安全语气生成结构化 JSON 草稿，嵌入商户基本签名。
+* #### [NEW] [src/lib/email.ts](file:///c:/Users/Administrator/Desktop/Review_Guard/src/lib/email.ts)
+  - 整合 Resend / Postmark Outbound API。封装发信状态机，执行创建 `pending`、发送更新 `sent`/`failed` 闭环。
+* #### [NEW] [src/app/api/webhooks/inbound/route.ts](file:///c:/Users/Administrator/Desktop/Review_Guard/src/app/api/webhooks/inbound/route.ts)
+  - 核心入库 Webhook：
+    1. 校验 Header `X-ReviewGuard-Webhook-Secret`。
+    2. 基于 `message_id` 去重。
+    3. 解析 Gmail 验证邮件，若匹配，写入 `inbound_emails` 状态为 `gmail_verification`。
+    4. 解析 Google 评价通知。若置信度低，生成待粘贴占位事件，生成 `magic_links`，发送**低置信度通知邮件**；若置信度高，生成 AI 草稿后发正常**警报邮件**。
+
+### 3. 精准明亮的直白页面
+* #### [NEW] [src/app/dashboard/page.tsx](file:///c:/Users/Administrator/Desktop/Review_Guard/src/app/dashboard/page.tsx)
+  - **极简明亮工单后台**：
+    - 展示专属转发前缀、Gmail 转发向导。
+    - **显示 Gmail 验证码提取结果**：系统自动轮询（或提供手动刷新按钮）最新 `gmail_verification` 类型的 `inbound_emails`，并在页面上清晰显示 Google 发来的验证码与确认链接！
+    - 商户门店配置（名称、电话、联系人、GBP 评价链接）。
+* #### [NEW] [src/app/alerts/[id]/page.tsx](file:///c:/Users/Administrator/Desktop/Review_Guard/src/app/alerts/[id]/page.tsx)
+  - **移动端 Magic Alert 极简高对比度响应页**：
+    - 验证 Token 有效期（72 小时内）。更新 `viewed_at`。
+    - 大字号高对比度明亮排版，底部常驻：`"⚠️ This temporary link will expire in 72 hours."`
+    - 低置信度模式下：显示输入框让商家方便粘贴差评正文，点击触发 AI 补全。
+    - 三种语气卡片式快速切换与内联编辑。
+    - 超大 **“Copy Reply Draft”** 按钮（点击后更新 `copied_at` ）。
+    - 超大 **“Open Google Business Profile”** 按钮（带引导词 `"Copy reply first, then paste it into your review response."`）。
+* #### [NEW] [src/snapshot/[business_slug]/page.tsx](file:///c:/Users/Administrator/Desktop/Review_Guard/src/snapshot/[business_slug]/page.tsx)
+  - **Cold Reachout 拓客报告单页**：
+    - 完全开放的明亮高对比度页面，展示预录入的差评原文、AI 拟写的 3 种完美公关回复。
+    - 配备强力的拓客 CTA，引导注册和激活免费试用。
+* #### [NEW] [src/app/debug/simulator/page.tsx](file:///c:/Users/Administrator/Desktop/Review_Guard/src/app/debug/simulator/page.tsx)
+  - **开发者独占调试沙盒**：支持粘贴 Google review 通知 HTML 或 Gmail 转发验证邮件 HTML，测试整套解析、去重、置信度、AI 语气、及 Gmail 验证提取的闭环。
+
+---
+
+## 验证与验收方案
+
+1. **Header Secret 与去重测试**：
+   - 使用包含 `Message-ID` 的 Webhook 请求，验证 Header 校验。连续发送两次，验证第二次被拦截并返回 200，防止重复发信。
+2. **低置信度警报发信测试**：
+   - 提交非标/缺失内容通知，确认发出告警邮件，链接跳转至 Magic Page 且提供手动输入粘贴框。
+3. **Gmail 验证码提取测试**：
+   - 粘贴一封 Gmail 自动转发确认邮件到 Simulator，验证系统是否能精准提取出 9 位数字验证码或确认 URL，并成功展现在 Dashboard 页面上。
+4. **Outbound 真实发信测试**：
+   - 触发 2 星告警，核对发件日志中 `alert_deliveries` 的状态转换：`pending` -> 投递API -> `sent` / `failed`。
